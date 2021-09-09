@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+
+if [ "$#" -ne 1 ]; then
+  echo "`basename $0` <disk>"
+  exit 1
+fi
+
+DISK=$1
+
+if [ ! -b "$DISK" ]; then
+  echo "$DISK is not a block device"
+  exit 1
+fi
+
+function unwrap
+{
+  if grep -qs '/mnt ' /proc/mounts; then
+    echo Unmount BTRFS subvolumes.
+    umount -R /mnt || true
+    sleep 1
+  fi
+
+  if [ "$(swapon -s | wc  -l)"  -gt "0" ]; then
+    echo Turn swap off.
+    swapoff -a
+    sleep 1
+  fi
+
+  if [ -e /dev/mapper/root ]; then
+    echo Unmap /dev/mapper/root.
+    cryptsetup luksClose /dev/mapper/root
+    sleep 1
+  fi
+
+  if [ -e /dev/mapper/swap ]; then
+    echo Unmap /dev/mapper/swap.
+    cryptsetup luksClose /dev/mapper/swap
+    sleep 1
+  fi
+
+  exit $1
+}
+
+trap unwrap SIGHUP SIGINT SIGTERM
+
+# 1. 512 MB EFI System Partition
+# 2. 512 MB /boot
+# 3. Encrypted 3 GB swap partition
+# 4. Encrypted BTRFS subvolumes for /, /home and /.snapshots
+
+sgdisk --clear --mbrtogpt \
+       --new=1:0:+512MiB --typecode=1:ef00 --change-name=1:EFI \
+       --new=2:0:+512MiB --typecode=2:8300 --change-name=2:boot \
+       --new=3:0:+3GiB   --typecode=3:8200 --change-name=3:encrypted_swap \
+       --new=4:0:0       --typecode=4:8300 --change-name=4:encrypted_root \
+       "$DISK" || unwrap 1
+
+sleep 5
+
+mkfs.fat -F32 -n EFI /dev/disk/by-partlabel/EFI || unwrap 1
+mkfs.ext4 -L boot /dev/disk/by-partlabel/boot || unwrap 1
+
+# /dev/mapper/swap -> /dev/disk/by-partlabel/encrypted_swap
+cryptsetup open --type plain --key-file /dev/urandom /dev/disk/by-partlabel/encrypted_swap swap || unwrap 1
+mkswap -L swap /dev/mapper/swap || unwrap 1
+swapon -L swap || unwrap 1
+
+# /dev/mapper/root -> /dev/disk/by-partlabel/encrypted_root
+cryptsetup luksFormat --align-payload=8192 -s 256 -c aes-xts-plain64 /dev/disk/by-partlabel/encrypted_root || unwrap 1
+cryptsetup open /dev/disk/by-partlabel/encrypted_root root || unwrap 1
+mkfs.btrfs --force --label root /dev/mapper/root || unwrap 1
+
+mount -t btrfs LABEL=root /mnt || unwrap 1
+btrfs subvolume create /mnt/root || unwrap 1
+btrfs subvolume create /mnt/home || unwrap 1
+btrfs subvolume create /mnt/snapshots || unwrap 1
+umount -R /mnt || unwrap 1
+
+mount -t btrfs -o subvol=root LABEL=root /mnt || unwrap 1
+mkdir /mnt/home || unwrap 1
+mount -t btrfs -o subvol=home LABEL=root /mnt/home || unwrap 1
+mkdir /mnt/.snapshots || unwrap 1
+mount -t btrfs -o subvol=snapshots LABEL=root /mnt/.snapshots || unwrap 1
+mkdir /mnt/boot || unwrap 1
+mount LABEL=boot /mnt/boot || unwrap 1
+mkdir /mnt/boot/efi || unwrap 1
+mount LABEL=EFI /mnt/boot/efi || unwrap 1

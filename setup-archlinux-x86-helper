@@ -1,0 +1,166 @@
+#!/usr/bin/bash
+
+if [ "$#" -ne 2 ]; then
+  echo "`basename $0` HOSTNAME USER"
+  exit 1
+fi
+
+# Validate the arguments.
+HOSTNAME=$1
+USER=$2
+echo "Hostname: $HOSTNAME"
+echo "User: $USER"
+
+# Time and date
+echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen || exit  1
+locale-gen || exit 1
+echo "LANG=en_US.UTF-8" >> /etc/locale.conf || exit 1
+ln -sf /usr/share/zoneinfo/Europe/Helsinki /etc/localtime || exit 1
+hwclock --systohc || exit 1
+timedatectl set-ntp true || exit 1
+
+cat <<EOF >> /etc/pacman.conf
+[multilib]
+Include = /etc/pacman.d/mirrorlist
+EOF
+
+# Packages
+yes '' | pacman -Syu \
+alsa-utils \
+amd-ucode \
+base-devel \
+bash-completion \
+bolt \
+bpftrace \
+btrfs-progs \
+ccache \
+cpupower \
+dosfstools \
+efibootmgr \
+fdm \
+fzf \
+git \
+grub \
+gvfs \
+gvfs-mtp \
+gvfs-smb \
+intel-ucode \
+iw \
+iwd \
+lib32-gnutls \
+libcurl-gnutls \
+linux \
+linux-firmware \
+linux-headers \
+networkmanager \
+man-db \
+man-pages \
+mc \
+mkinitcpio \
+msmtp \
+mtools \
+mutt \
+neovim \
+ntfs-3g \
+openssh \
+os-prober \
+p7zip \
+perl-authen-sasl \
+perl-io-socket-ssl \
+pkgfile \
+pwgen \
+pv \
+python-pip \
+python-gpgme \
+realtime-privileges \
+rtirq \
+sccache \
+socat \
+starship \
+strace \
+sudo \
+tmux \
+tree \
+unrar \
+unzip \
+w3m \
+|| exit 1
+
+# Add the missing mkinitcpio hooks.
+sed -i 's/HOOKS=(\(.*\))/HOOKS=(\1 systemd sd-vconsole block btrfs sd-encrypt)/' /etc/mkinitcpio.conf || exit 1
+
+# Set a larger font.
+cat <<EOF >> /etc/vconsole.conf
+FONT=ter-p32n
+FONT_MAP=8859-2
+EOF
+
+mkinitcpio -p linux || exit 1
+
+# GRUB
+CIPHER_ROOT_UUID=`blkid -o value -s UUID /dev/disk/by-partlabel/encrypted_root`
+ROOT_UUID=`blkid -o value -s UUID /dev/mapper/root`
+CMDLINE="rd.luks.name=$CIPHER_ROOT_UUID=root root=UUID=$ROOT_UUID rootflags=subvol=root threadirqs intel_iommu=on iommu=pt"
+
+sed -i "s/\(GRUB_CMDLINE_LINUX_DEFAULT=\)\"\(.*\)\"/\1\"\2 $CMDLINE\"/" /etc/default/grub || exit 1
+sed -i "s/.*\(GRUB_ENABLE_CRYPTODISK\).*/\1=y/" /etc/default/grub || exit 1
+sed -i "s/quiet//" /etc/default/grub || exit 1
+
+grub-install --target=x86_64-efi --bootloader-id=archlinux --recheck || exit 1
+grub-mkconfig -o /boot/grub/grub.cfg || exit 1
+
+echo "$HOSTNAME" >> /etc/hostname || exit 1
+echo "" >> /etc/hosts || exit 1
+
+cat <<EOF >> /etc/hosts
+127.0.0.1 localhost
+::1 localhost
+127.0.1.1 $HOSTNAME.lan $HOSTNAME
+EOF
+
+cat <<EOF >> /etc/NetworkManager/conf.d/wifi_backend.conf || exit 1
+[device]
+wifi.backend=iwd
+EOF
+
+echo "set bell-style none" >> /etc/inputrc || exit 1
+
+cat <<EOF >> /etc/sysctl.d/99-local.conf || exit 1
+vm.swappiness = 10
+fs.inotify.max_user_watches = 100000
+EOF
+
+cat <<EOF >> /etc/systemd/system/disable-turbo-boost.service || exit 1
+[Unit]
+Description=Disable Turbo Boost on a Intel CPU
+
+[Service]
+ExecStart=/bin/sh -c "echo 1 > /sys/devices/system/cpu/intel_pstate/no_turbo"
+ExecStop=/bin/sh -c "echo 0 > /sys/devices/system/cpu/intel_pstate/no_turbo"
+RemainAfterExit=yes
+
+[Install]
+WantedBy=sysinit.target
+EOF
+
+sed -i "s/#governor=.*/governor='performance'/g" /etc/default/cpupower
+
+cat <<EOF >> /etc/pam.d/passwd
+password	optional	pam_gnome_keyring.so
+EOF
+
+systemctl enable bluetooth.service
+systemctl enable bolt.service
+systemctl enable cpupower.service
+systemctl enable disable-turbo-boost.service
+systemctl enable NetworkManager.service
+systemctl enable rtirq.service
+systemctl enable gdm.service
+
+systemctl enable iwd.service
+systemctl disable wpa_supplicant.service
+
+echo "%wheel ALL=(ALL) ALL" >> /etc/sudoers || exit 1
+useradd -m -G wheel,realtime $USER || exit 1
+passwd -d $USER || exit 1 # no password
+passwd -l root || exit 1

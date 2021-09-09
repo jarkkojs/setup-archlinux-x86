@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+
+function unwrap
+{
+    if grep -qs '/mnt ' /proc/mounts; then
+        echo Unmount BTRFS subvolumes.
+        umount -R /mnt || true
+        sleep 1
+    fi
+
+    if [ "$(swapon -s | wc  -l)"  -gt "0" ]; then
+        echo Turn swap off.
+        swapoff -a
+        sleep 1
+    fi
+
+    if [ -e /dev/mapper/root ]; then
+        echo Unmap /dev/mapper/root.
+        cryptsetup luksClose /dev/mapper/root
+        sleep 1
+    fi
+
+    if [ -e /dev/mapper/swap ]; then
+        echo Unmap /dev/mapper/swap.
+        cryptsetup luksClose /dev/mapper/swap
+        sleep 1
+    fi
+
+    exit $1
+}
+
+trap unwrap SIGHUP SIGINT SIGTERM
+
+if [ "$#" -ne 3 ]; then
+  echo "`basename $0` <drive> <hostname> <username>"
+  exit 1
+fi
+
+DISK=$1
+HOSTNAME=$2
+USERNAME=$3
+
+if [ ! -b "$DISK" ]; then
+  echo "$DISK is not a block device"
+  exit 1
+fi
+
+./partition $DISK || exit 1
+
+pacstrap /mnt base || unwrap 1
+
+genfstab -L -p /mnt > /mnt/etc/fstab || unwrap 1
+sed -i s+LABEL=swap+/dev/mapper/swap+ /mnt/etc/fstab || unwrap 1
+echo "swap /dev/disk/by-partlabel/encrypted_swap /dev/urandom swap,offset=2048,cipher=aes-xts-plain64,size=256" >> /mnt/etc/crypttab || unwrap 1
+
+cp -v setup-archlinux-x86-helper /mnt/root || unwrap 1
+arch-chroot /mnt /root/setup-archlinux-x86-helper $HOSTNAME $USERNAME || unwrap 1
+
+unwrap 0
